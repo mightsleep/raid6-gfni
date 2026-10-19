@@ -1,0 +1,84 @@
+# Manually triggered test + bench on GitHub runners. Runners are randomly Intel
+# Xeon or AMD EPYC, hence several identical jobs: each records the CPU model
+# and flags, and the artifact carries the model in its name.
+name: bench
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04]
+        run: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: CPU
+        id: cpu
+        run: |
+          lscpu
+          model=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+          flags=$(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx2|avx512f|avx512bw|avx512vl|gfni|vaes|vpclmulqdq' | tr '\n' ' ')
+          echo "model: $model"
+          echo "flags: $flags"
+          slug=$(printf '%s' "$model" | tr -c 'A-Za-z0-9' '-' | tr -s '-' | sed 's/^-//; s/-$//')
+          echo "name=bench-${{ matrix.os }}-${{ matrix.run }}-$slug" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${{ matrix.os }} #${{ matrix.run }}: $model"
+            echo
+            echo "flags: \`$flags\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: build
+        env:
+          CC: gcc
+          OUT: ${{ runner.temp }}/build
+        run: |
+          gcc --version | head -1
+          ./build.sh
+
+      - name: tests
+        env:
+          B: ${{ runner.temp }}/build/raid6
+        run: |
+          set -o pipefail
+          mkdir -p out
+          "$B" | tee out/test.txt
+          # also the path without AVX-512 (like N100), if the CPU has AVX2 + GFNI
+          "$B" --no-avx512 | tee -a out/test.txt
+          {
+            echo '```'
+            grep -E '^(tests|skipped|affine)' out/test.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: bench
+        env:
+          B: ${{ runner.temp }}/build/raid6
+          NAME: ${{ steps.cpu.outputs.name }}
+        run: |
+          set -o pipefail
+          taskset -c 0 "$B" bench --csv "out/$NAME.csv" | tee "out/$NAME.txt"
+          cat out/test.txt >> "out/$NAME.txt"
+          rm out/test.txt
+          {
+            echo '```'
+            grep -E '^(# instructions|vgf2p8affineqb|vpxor)' "out/$NAME.txt" || true
+            grep -E ' 65536 B ' "out/$NAME.txt" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ${{ steps.cpu.outputs.name }}
+          path: out/
